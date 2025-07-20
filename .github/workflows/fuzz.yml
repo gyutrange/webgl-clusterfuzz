@@ -26,7 +26,7 @@ jobs:
           language: c++
           sanitizer: address
           upload-build: true
-          storage-repo: https://github.com/gyutrange/webgl-clusterfuzz-corpi.git
+          storage-repo: https://x-access-token:${{ secrets.ACTIONS_SECRET_PAT }}@github.com/gyutrange/webgl-clusterfuzz-corpi.git
           project-src-path: .
 
       - name: Run Fuzzers
@@ -35,6 +35,6 @@ jobs:
           language: c++
           sanitizer: address
           fuzz-time: 600
-          storage-repo: https://github.com/gyutrange/webgl-clusterfuzz-corpi.git
+          storage-repo: https://x-access-token:${{ secrets.ACTIONS_SECRET_PAT }}@github.com/gyutrange/webgl-clusterfuzz-corpi.git
           project-src-path: .
 
