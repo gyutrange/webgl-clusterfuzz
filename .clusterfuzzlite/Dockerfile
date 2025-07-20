@@ -6,10 +6,10 @@ RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add
 RUN echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
 RUN apt-get update && apt-get install -y google-chrome-stable
 
-# 소스 코드 복사
+# 소스 복사 및 작업 디렉토리 설정
 COPY . /src/html-fuzz
 WORKDIR /src/html-fuzz
 
 # 빌드 스크립트 실행
-RUN chmod +x .clusterfuzzlite/build.sh && .clusterfuzzlite/build.sh
+RUN chmod +x .clusterfuzzlite/build.sh && ./.clusterfuzzlite/build.sh
 
