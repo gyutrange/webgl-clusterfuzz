@@ -4,4 +4,5 @@ fuzzing_engines:
 sanitizers:
   - address
 main_repo: https://github.com/gyutrange/webgl-clusterfuzz
+dockerfile_path: .clusterfuzzlite/Dockerfile
 
