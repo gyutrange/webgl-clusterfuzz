@@ -1,24 +1,37 @@
-name: ClusterFuzzLite
+name: Fuzzing
 
 on:
   push:
     branches:
       - main
   pull_request:
+    branches:
+      - main
 
 jobs:
-  fuzzing:
+  Fuzzing:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
+
       - name: Build Fuzzers
-        uses: google/clusterfuzzlite/actions/build_fuzzers@main
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
         with:
           language: c++
           sanitizer: address
-          upload-build: false
+          storage-repo: https://github.com/gyutrange/webgl-clusterfuzz-corpi.git
+          upload-build: true
+
       - name: Run Fuzzers
-        uses: google/clusterfuzzlite/actions/run_fuzzers@main
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
         with:
-          fuzz-seconds: 600
+          fuzz-time: 600
+          storage-repo: https://github.com/gyutrange/webgl-clusterfuzz-corpi.git
+          sanitizer: address
+          language: c++
 
