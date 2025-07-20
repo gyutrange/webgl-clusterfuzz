@@ -34,7 +34,5 @@ jobs:
         with:
           language: c++
           sanitizer: address
-          fuzz-time: 600
           storage-repo: https://x-access-token:${{ secrets.ACTIONS_SECRET_PAT }}@github.com/gyutrange/webgl-clusterfuzz-corpi.git
-          project-src-path: .
 
