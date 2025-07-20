@@ -12,9 +12,9 @@ jobs:
   Fuzzing:
     runs-on: ubuntu-latest
     permissions:
-      contents: write           # corpus 저장 위해 write 필요
+      contents: write           # corpus 저장 위해 필요
       actions: read
-      security-events: write   # CodeQL 관련 설정 시 필요할 수 있음
+      security-events: write   # (선택) Code Scanning 경고 위해
 
     steps:
       - name: Checkout code
@@ -27,8 +27,7 @@ jobs:
           sanitizer: address
           upload-build: true
           storage-repo: https://github.com/gyutrange/webgl-clusterfuzz-corpi.git
-          project-src-path: .                     # 중요: 현재 루트 기준
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          project-src-path: .
 
       - name: Run Fuzzers
         uses: google/clusterfuzzlite/actions/run_fuzzers@v1
@@ -38,5 +37,4 @@ jobs:
           fuzz-time: 600
           storage-repo: https://github.com/gyutrange/webgl-clusterfuzz-corpi.git
           project-src-path: .
-          github-token: ${{ secrets.GITHUB_TOKEN }}
 
