@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebGL GPU Fuzzer - Complete Attack & Workaround Suite</title>
+  <style>
+    body { background: #000; color: #0f0; font-family: monospace; white-space: pre-wrap; }
+    #log { max-height: 90vh; overflow-y: auto; border: 1px solid #333; padding: 10px; }
+    .error { color: #ff4500; font-weight: bold; } /* OrangeRed */
+    .info { color: #1e90ff; } /* DodgerBlue */
+    .success { color: #32cd32; } /* LimeGreen */
+    .strategy { color: #dda0dd; } /* Plum */
+    .workaround { color: #f0e68c; font-style: italic; } /* Khaki */
+  </style>
+</head>
+<body>
+  <h2>WebGL GPU Fuzzer - Complete Attack & Workaround Suite</h2>
+  <div id="log"></div>
+  <!-- This canvas is the source of our shared WebGL context -->
+  <canvas id="fuzz_canvas" width="512" height="512" style="display: none;"></canvas>
+
+  <script>
+    let gl;
+    let logEl;
+
+    // --- UTILITY FUNCTIONS ---
+    function log(msg, type = '') {
+      console.log(msg);
+      if (logEl) {
+        const span = document.createElement('span');
+        if (type) span.className = type;
+        span.textContent = `\n${msg}`;
+        logEl.appendChild(span);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
+
+    function detectGLErrors(strategyName) {
+      if (!gl || gl.isContextLost()) return;
+      let err, errs = [];
+      while ((err = gl.getError()) !== gl.NO_ERROR) {
+        const errString = `GL Error: 0x${err.toString(16)}`;
+        errs.push(errString);
+        if (err === 0x9242) { // CONTEXT_LOST_WEBGL
+          log(`[!!!] CRITICAL: CONTEXT_LOST_WEBGL detected in ${strategyName}`, 'error');
+        }
+      }
+      if (errs.length) log(`[!] Detected GL errors in ${strategyName}:\n` + errs.join('\n'), 'error');
+    }
+    
+    function tryGC() {
+        if (typeof gc === 'function') {
+            log('[GC] Forcing Garbage Collection...', 'info');
+            gc();
+        }
+    }
+
+    // --- ATTACK STRATEGIES (ALL ASYNC) ---
+
+    async function strategy10_staleImageBitmapReuse() {
+        log('[*] strategy10: Reuse after context restore', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const canv = new OffscreenCanvas(128, 128);
+        const bitmap = await createImageBitmap(canv);
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+
+        const ext = gl.getExtension("WEBGL_lose_context");
+        if (ext) {
+            ext.loseContext();
+            await new Promise(r => setTimeout(r, 100));
+            ext.restoreContext();
+            await new Promise(r => setTimeout(r, 200));
+            try {
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+            } catch (e) { log(`[!] Exception in strategy10: ${e.message}`, 'error'); }
+        }
+        detectGLErrors('strategy10');
+    }
+
+    async function strategy11_closedBitmapReuse() {
+        log('[*] strategy11: Reuse closed bitmap', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const canv = new OffscreenCanvas(128, 128);
+        const bitmap = await createImageBitmap(canv);
+        bitmap.close();
+        try {
+            const tex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+        } catch (e) { log(`[!] Exception in strategy11: ${e.message}`, 'error'); }
+        detectGLErrors('strategy11');
+    }
+    
+    async function strategy12_offscreenTransferStaleAccess() {
+        log('[*] strategy12: Reuse after worker termination', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const workerBlob = new Blob([`onmessage = async (e) => { const bmp = await createImageBitmap(e.data); postMessage(bmp, [bmp]); }`], { type: 'application/javascript' });
+        const worker = new Worker(URL.createObjectURL(workerBlob));
+        const offscreen = new OffscreenCanvas(64, 64);
+        
+        const bmp = await new Promise(resolve => {
+            worker.onmessage = e => resolve(e.data);
+            worker.postMessage(offscreen, [offscreen]);
+        });
+        
+        worker.terminate();
+        await new Promise(r => setTimeout(r, 100));
+        
+        try {
+            const tex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+        } catch (e) { log(`[!] Exception in strategy12: ${e.message}`, 'error'); }
+        detectGLErrors('strategy12');
+    }
+
+    async function strategy13_gcBeforeReuse() {
+        log('[*] strategy13: Reuse after GC', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const canv = new OffscreenCanvas(128, 128);
+        let bitmap = await createImageBitmap(canv);
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+        
+        let ref = bitmap;
+        bitmap = null; // Drop reference
+        tryGC();
+        
+        await new Promise(r => setTimeout(r, 500));
+        try {
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, ref);
+        } catch (e) { log(`[!] Exception in strategy13: ${e.message}`, 'error'); }
+        detectGLErrors('strategy13');
+    }
+
+    async function strategy14_repeatReuseAfterClose() {
+        log('[*] strategy14: Repeatedly reuse closed bitmap', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const canv = new OffscreenCanvas(128, 128);
+        const bitmap = await createImageBitmap(canv);
+        bitmap.close();
+        for (let i = 0; i < 3; i++) {
+            try {
+                const tex = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+            } catch (e) { log(`[!] Exception in strategy14 (${i}): ${e.message}`, 'error'); }
+        }
+        detectGLErrors('strategy14');
+    }
+
+    async function strategy15_asyncBitmapDerefAfterClose() {
+        log('[*] strategy15: Deferred reuse of closed bitmap', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const canv = new OffscreenCanvas(256, 256);
+        const bitmap = await createImageBitmap(canv);
+        bitmap.close();
+        for (let i = 0; i < 20; i++) new Uint8Array(4096); // mini-spray
+        
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+            const tex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+        } catch (e) { log(`[!] Exception in strategy15: ${e.message}`, 'error'); }
+        detectGLErrors('strategy15');
+    }
+
+    async function strategy16_massBitmapGCAndDeref() {
+        log('[*] strategy16: Mass bitmap creation from OffscreenCanvas', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const canv = new OffscreenCanvas(64, 64);
+        for (let i = 0; i < 50; i++) {
+            try {
+                const bitmap = await createImageBitmap(canv);
+                const tex = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+                bitmap.close();
+                gl.deleteTexture(tex);
+            } catch (e) {
+                log(`[!] Exception in strategy16 (${i}): ${e.message}`, 'error');
+                return; // Stop on failure
+            }
+        }
+        detectGLErrors('strategy16');
+    }
+
+    async function strategy17_mixedResourcePressure() {
+        log('[*] strategy17: Mixed CPU/GPU memory pressure', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        try {
+            log('[17] Allocating large ArrayBuffer...', 'info');
+            let bigBuffer = new ArrayBuffer(1024 * 1024 * 128); // 128MB
+            const canv = new OffscreenCanvas(256, 256);
+            const bitmap = await createImageBitmap(canv);
+            const tex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+            bitmap.close();
+            bigBuffer = null;
+            log('[17] Mixed pressure test finished.');
+        } catch (e) { log(`[!] Exception in strategy17: ${e.message}`, 'error'); }
+        detectGLErrors('strategy17');
+    }
+
+    async function strategy18_rAFvsSetTimeoutRace() {
+        log('[*] strategy18: requestAnimationFrame vs setTimeout race', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const canv = new OffscreenCanvas(128, 128);
+        const bitmap = await createImageBitmap(canv);
+        requestAnimationFrame(() => {
+            try {
+                if (gl.isContextLost()) return;
+                const tex = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+                detectGLErrors('strategy18_rAF');
+            } catch(e) { log(`[!] Exception in strategy18 (rAF): ${e.message}`, 'error'); }
+        });
+        setTimeout(() => { bitmap.close(); }, 0);
+    }
+    
+    async function strategy19_doubleCloseReuse() {
+        log('[*] strategy19: Double close then reuse', 'strategy');
+        if (!gl || gl.isContextLost()) return;
+        const canv = new OffscreenCanvas(128, 128);
+        const bitmap = await createImageBitmap(canv);
+        bitmap.close();
+        try { bitmap.close(); } catch(e) { log(`[19] Info: Second close threw as expected.`); }
+        try {
+            const tex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+        } catch (e) { log(`[!] Exception in strategy19 (reuse): ${e.message}`, 'error'); }
+        detectGLErrors('strategy19');
+    }
+
+    // --- ✅ NEW WORKAROUND STRATEGIES ---
+
+    async function strategy20_workaround_HTMLCanvas() {
+        log('[*] strategy20 (Workaround): Using HTMLCanvasElement', 'workaround');
+        if (!gl || gl.isContextLost()) return;
+        let success = true;
+        for (let i = 0; i < 50; i++) {
+            try {
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = 128; tempCanvas.height = 128;
+                const bitmap = await createImageBitmap(tempCanvas);
+                const tex = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+                bitmap.close();
+                gl.deleteTexture(tex);
+            } catch (e) {
+                log(`[!] Exception in strategy20 (${i}): ${e.message}`, 'error');
+                success = false;
+                break;
+            }
+        }
+        if (success) log('[20] Finished 50 iterations with HTMLCanvasElement successfully.', 'success');
+        detectGLErrors('strategy20');
+    }
+
+    async function strategy21_workaround_ImageData() {
+        log('[*] strategy21 (Workaround): Using ImageData from OffscreenCanvas', 'workaround');
+        if (!gl || gl.isContextLost()) return;
+        let success = true;
+        for (let i = 0; i < 50; i++) {
+            try {
+                const offscreen = new OffscreenCanvas(128, 128);
+                const ctx = offscreen.getContext("2d");
+                ctx.fillRect(0, 0, 128, 128);
+                const imageData = ctx.getImageData(0, 0, 128, 128);
+                const bitmap = await createImageBitmap(imageData);
+
+                const tex = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+                bitmap.close();
+                gl.deleteTexture(tex);
+            } catch (e) {
+                log(`[!] Exception in strategy21 (${i}): ${e.message}`, 'error');
+                success = false;
+                break;
+            }
+        }
+        if (success) log('[21] Finished 50 iterations with ImageData successfully.', 'success');
+        detectGLErrors('strategy21');
+    }
+
+
+    // --- FUZZING ENGINE ---
+    const ALL_STRATEGIES = [
+        strategy10_staleImageBitmapReuse, strategy11_closedBitmapReuse,
+        strategy12_offscreenTransferStaleAccess, strategy13_gcBeforeReuse,
+        strategy14_repeatReuseAfterClose, strategy15_asyncBitmapDerefAfterClose,
+        strategy16_massBitmapGCAndDeref, strategy17_mixedResourcePressure,
+        strategy18_rAFvsSetTimeoutRace, strategy19_doubleCloseReuse,
+        strategy20_workaround_HTMLCanvas, strategy21_workaround_ImageData
+    ];
+
+    async function fuzzLoop(iterations) {
+      for (let i = 0; i < iterations; i++) {
+        log(`\n--- Starting Fuzz Iteration ${i + 1}/${iterations} ---`, 'success');
+        const shuffledStrategies = ALL_STRATEGIES.sort(() => 0.5 - Math.random());
+        for (const strategyFn of shuffledStrategies) {
+            if (gl.isContextLost()) {
+                log('[!!!] Context is lost. Aborting further strategies in this iteration.', 'error');
+                break;
+            }
+            try {
+                await strategyFn();
+            } catch (e) { log(`[!] Uncaught exception in ${strategyFn.name}: ${e.message}`, 'error'); }
+            tryGC();
+            await new Promise(r => setTimeout(r, 150)); // Slightly longer delay
+        }
+      }
+      log("\n[+] All fuzzing iterations complete.", 'success');
+    }
+
+    onload = () => {
+      logEl = document.getElementById('log');
+      log("[*] Initializing WebGL context from DOM canvas...");
+      
+      const canvas = document.getElementById('fuzz_canvas');
+      canvas.addEventListener('webglcontextlost', (e) => {
+        e.preventDefault();
+        log("[!!!] EVENT DETECTED: webglcontextlost", 'error');
+      }, false);
+      canvas.addEventListener('webglcontextrestored', () => {
+        log("[*] EVENT DETECTED: webglcontextrestored", 'info');
+      }, false);
+      
+      gl = canvas.getContext('webgl2', { preserveDrawingBuffer: false });
+
+      if (gl) {
+        log("[*] Starting WebGL GPU fuzzer with DOM canvas context...", 'success');
+        log("NOTE: Run Chrome with --js-flags=--expose-gc for explicit GC calls.", "info");
+        fuzzLoop(5);
+      } else {
+        log("[!] Failed to initialize WebGL2 context from DOM canvas.", 'error');
+      }
+    }
+  </script>
+</body>
+</html>

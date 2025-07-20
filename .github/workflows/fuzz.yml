@@ -1,0 +1,24 @@
+name: ClusterFuzzLite
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  fuzzing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build Fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@main
+        with:
+          language: c++
+          sanitizer: address
+          upload-build: false
+      - name: Run Fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@main
+        with:
+          fuzz-seconds: 600
+
